@@ -31,10 +31,10 @@ case "$AVAILABLE_CPUS" in
     ''|*[!0-9]*|0) AVAILABLE_CPUS=1 ;;
 esac
 
-# Benchmarks on the target 64-vCPU host peaked at 48 RandomX threads.
+
 if [ -z "${THREADS+x}" ]; then
     if [ "$AVAILABLE_CPUS" -ge 64 ]; then
-        THREADS=48
+        THREADS=64
     else
         THREADS="$AVAILABLE_CPUS"
     fi
